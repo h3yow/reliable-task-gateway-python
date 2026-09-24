@@ -35,7 +35,8 @@ class IllegalTransitionError(Exception):
 
 def check_transition(src: TaskStatus, dst: TaskStatus) -> None:
     """校验状态迁移是否合法，非法则抛出 IllegalTransitionError。"""
-    raise NotImplementedError
+    if dst not in ALLOWED_TRANSITIONS[src]:
+        raise IllegalTransitionError(f"illegal transition: {src.value} -> {dst.value}")
 
 
 @dataclass

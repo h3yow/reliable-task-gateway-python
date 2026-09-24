@@ -6,9 +6,30 @@
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
+import threading
+import time
 
-from app.models import Task, TaskStatus
+from app.models import IllegalTransitionError, Task, TaskStatus, check_transition
+
+logger = logging.getLogger("gateway.store")
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    payload_hash TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    result TEXT,
+    error TEXT,
+    version INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+)
+"""
 
 
 class PayloadConflictError(Exception):
@@ -22,10 +43,33 @@ class PayloadConflictError(Exception):
 class TaskStore:
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
-        raise NotImplementedError
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        with self._conn:
+            self._conn.execute(_SCHEMA)
 
     def close(self) -> None:
-        raise NotImplementedError
+        with self._lock:
+            self._conn.close()
+
+    @staticmethod
+    def _row_to_task(row: sqlite3.Row) -> Task:
+        return Task(
+            task_id=row["task_id"],
+            idempotency_key=row["idempotency_key"],
+            payload_hash=row["payload_hash"],
+            payload=row["payload"],
+            status=TaskStatus(row["status"]),
+            attempts=row["attempts"],
+            result=row["result"],
+            error=row["error"],
+            version=row["version"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
 
     def insert_if_absent(self, task: Task) -> tuple[Task, bool]:
         """按幂等键插入任务。
@@ -34,10 +78,42 @@ class TaskStore:
         - 载荷一致 -> 返回已存在任务与 False（重复提交，返回首次结果）；
         - 载荷不一致 -> 抛 PayloadConflictError。
         """
-        raise NotImplementedError
+        now = time.time()
+        task.created_at = task.updated_at = now
+        with self._lock, self._conn:
+            try:
+                self._conn.execute(
+                    "INSERT INTO tasks (task_id, idempotency_key, payload_hash, payload,"
+                    " status, attempts, result, error, version, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (task.task_id, task.idempotency_key, task.payload_hash, task.payload,
+                     task.status.value, task.attempts, task.result, task.error,
+                     task.version, task.created_at, task.updated_at),
+                )
+                logger.info("store.insert key=%s task_id=%s status=%s (新建)",
+                            task.idempotency_key, task.task_id, task.status.value)
+                return task, True
+            except sqlite3.IntegrityError:
+                row = self._conn.execute(
+                    "SELECT * FROM tasks WHERE idempotency_key=?",
+                    (task.idempotency_key,),
+                ).fetchone()
+                existing = self._row_to_task(row)
+                if existing.payload_hash != task.payload_hash:
+                    logger.warning(
+                        "store.insert key=%s 载荷冲突: 已有hash=%s 新hash=%s -> 拒绝",
+                        task.idempotency_key, existing.payload_hash, task.payload_hash)
+                    raise PayloadConflictError(task.idempotency_key)
+                logger.info("store.insert key=%s 幂等命中，返回已有任务 task_id=%s status=%s",
+                            task.idempotency_key, existing.task_id, existing.status.value)
+                return existing, False
 
     def get_by_key(self, idempotency_key: str) -> Task | None:
-        raise NotImplementedError
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM tasks WHERE idempotency_key=?", (idempotency_key,)
+            ).fetchone()
+        return self._row_to_task(row) if row else None
 
     def transition(self, task_id: str, expected: TaskStatus, target: TaskStatus,
                    *, result: str | None = None, error: str | None = None,
@@ -47,4 +123,35 @@ class TaskStore:
         迁移合法性由 models.check_transition 校验；条件不满足时抛
         IllegalTransitionError，保证并发更新不丢更新、终态不可变更。
         """
-        raise NotImplementedError
+        check_transition(expected, target)
+        now = time.time()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE tasks SET status=?, result=COALESCE(?, result),"
+                " error=COALESCE(?, error),"
+                " attempts=attempts+?, version=version+1, updated_at=?"
+                " WHERE task_id=? AND status=?",
+                (target.value, result, error, 1 if inc_attempt else 0,
+                 now, task_id, expected.value),
+            )
+            if cur.rowcount == 0:
+                row = self._conn.execute(
+                    "SELECT status FROM tasks WHERE task_id=?", (task_id,)
+                ).fetchone()
+                actual = TaskStatus(row["status"]) if row else None
+                logger.warning(
+                    "store.transition task_id=%s 迁移失败: 期望=%s 实际=%s 目标=%s",
+                    task_id, expected.value, actual, target.value)
+                raise IllegalTransitionError(
+                    f"task {task_id}: expected {expected.value}, actual "
+                    f"{actual.value if actual else 'MISSING'}, target {target.value}")
+            row = self._conn.execute(
+                "SELECT * FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+            task = self._row_to_task(row)
+            logger.info(
+                "store.transition task_id=%s key=%s 状态迁移 %s -> %s "
+                "(attempts=%d, version=%d, result=%r, error=%r)",
+                task.task_id, task.idempotency_key, expected.value, target.value,
+                task.attempts, task.version, task.result, task.error)
+            return task
