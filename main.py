@@ -1,19 +1,32 @@
 """可靠任务网关 HTTP 入口。"""
 from __future__ import annotations
 
+import logging
 import os
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from app.breaker import CircuitBreaker, CircuitOpenError
+from app.breaker import CircuitBreaker
 from app.downstream import RetryPolicy
 from app.service import SubmitOutcome, TaskGateway
 from app.store import PayloadConflictError, TaskStore
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+
 DB_PATH = os.environ.get("GATEWAY_DB", "gateway.db")
 
 app = FastAPI(title="Reliable Task Gateway")
+
+
+class EchoClient:
+    """默认下游客户端：回显载荷（生产环境可替换为真实下游）。"""
+
+    def call(self, task_id: str, payload: str) -> str:
+        return f"echo:{payload}"
 
 
 class SubmitRequest(BaseModel):
@@ -64,21 +77,15 @@ def get_task(idempotency_key: str):
 @app.on_event("startup")
 def _startup() -> None:
     store = TaskStore(DB_PATH)
-    from main import default_client  # 下游客户端，可替换
     app.state.store = store
     app.state.gateway = TaskGateway(
         store=store,
-        client=default_client(),
-        breaker=CircuitBreaker(),
-        retry=RetryPolicy(),
+        client=EchoClient(),
+        breaker=CircuitBreaker(failure_threshold=3, recovery_timeout=30.0),
+        retry=RetryPolicy(max_attempts=3, base_delay=0.1),
     )
 
 
 @app.on_event("shutdown")
 def _shutdown() -> None:
     app.state.store.close()
-
-
-def default_client():
-    from app.downstream import NonRetryableError
-    raise NonRetryableError("no downstream client configured")
