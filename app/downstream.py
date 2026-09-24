@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Protocol
+import time
 
 
 class DownstreamError(Exception):
@@ -24,7 +25,7 @@ class DownstreamClient(Protocol):
 
 class RetryPolicy:
     def __init__(self, max_attempts: int = 3, base_delay: float = 0.01,
-                 sleep=...) -> None:
+                 sleep=time.sleep) -> None:
         self._max_attempts = max_attempts
         self._base_delay = base_delay
         self._sleep = sleep
@@ -35,4 +36,4 @@ class RetryPolicy:
 
     def wait(self, attempt: int) -> None:
         """第 attempt 次失败后的退避等待（指数退避）。"""
-        raise NotImplementedError
+        self._sleep(self._base_delay * (2 ** (attempt - 1)))
