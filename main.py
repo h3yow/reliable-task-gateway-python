@@ -1,8 +1,1 @@
-from fastapi import FastAPI
-
-app = FastAPI()
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+from app.main import app  # noqa: F401  (uvicorn 入口: uvicorn main:app)
