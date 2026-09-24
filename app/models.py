@@ -21,7 +21,9 @@ TERMINAL_STATES: frozenset[TaskStatus] = frozenset(
 ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.PENDING: frozenset({TaskStatus.RUNNING, TaskStatus.CIRCUIT_REJECTED}),
     TaskStatus.RUNNING: frozenset(
-        {TaskStatus.PENDING, TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CIRCUIT_REJECTED}
+        # RUNNING -> RUNNING 为自环，仅用于重试时递增 attempts
+        {TaskStatus.RUNNING, TaskStatus.PENDING, TaskStatus.SUCCEEDED,
+         TaskStatus.FAILED, TaskStatus.CIRCUIT_REJECTED}
     ),
     TaskStatus.SUCCEEDED: frozenset(),
     TaskStatus.FAILED: frozenset(),
