@@ -11,23 +11,32 @@ class TaskStatus(str, enum.Enum):
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"          # 不可重试失败（终态）
     CIRCUIT_REJECTED = "CIRCUIT_REJECTED"  # 熔断拒绝（终态）
+    TIMED_OUT = "TIMED_OUT"    # 超过最长执行时限（终态）
+    CANCELLED = "CANCELLED"    # 调用方主动取消（终态）
 
 
 TERMINAL_STATES: frozenset[TaskStatus] = frozenset(
-    {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CIRCUIT_REJECTED}
+    {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CIRCUIT_REJECTED,
+     TaskStatus.TIMED_OUT, TaskStatus.CANCELLED}
 )
 
 # 合法状态迁移表
 ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
-    TaskStatus.PENDING: frozenset({TaskStatus.RUNNING, TaskStatus.CIRCUIT_REJECTED}),
+    TaskStatus.PENDING: frozenset(
+        {TaskStatus.RUNNING, TaskStatus.CIRCUIT_REJECTED,
+         TaskStatus.TIMED_OUT, TaskStatus.CANCELLED}
+    ),
     TaskStatus.RUNNING: frozenset(
         # RUNNING -> RUNNING 为自环，仅用于重试时递增 attempts
         {TaskStatus.RUNNING, TaskStatus.PENDING, TaskStatus.SUCCEEDED,
-         TaskStatus.FAILED, TaskStatus.CIRCUIT_REJECTED}
+         TaskStatus.FAILED, TaskStatus.CIRCUIT_REJECTED,
+         TaskStatus.TIMED_OUT, TaskStatus.CANCELLED}
     ),
     TaskStatus.SUCCEEDED: frozenset(),
     TaskStatus.FAILED: frozenset(),
     TaskStatus.CIRCUIT_REJECTED: frozenset(),
+    TaskStatus.TIMED_OUT: frozenset(),
+    TaskStatus.CANCELLED: frozenset(),
 }
 
 
@@ -54,3 +63,7 @@ class Task:
     version: int = 0
     created_at: float = 0.0
     updated_at: float = 0.0
+    # 最长执行时限的绝对截止时刻（epoch 秒）；None 表示不限时（老提交方式）
+    deadline_at: float | None = None
+    # 持久化的取消意图：重启后仍生效；终态以 status 为准
+    cancel_requested: bool = False

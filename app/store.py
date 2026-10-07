@@ -27,9 +27,19 @@ CREATE TABLE IF NOT EXISTS tasks (
     error TEXT,
     version INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    deadline_at REAL,
+    cancel_requested INTEGER NOT NULL DEFAULT 0
 )
 """
+
+# 老版本库表缺少的列 -> 追加列定义（升级兼容：老任务 deadline_at 为 NULL，
+# 即不限时；cancel_requested 默认 0）
+_MIGRATIONS = {
+    "deadline_at": "ALTER TABLE tasks ADD COLUMN deadline_at REAL",
+    "cancel_requested":
+        "ALTER TABLE tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
+}
 
 
 class PayloadConflictError(Exception):
@@ -50,6 +60,17 @@ class TaskStore:
         self._conn.execute("PRAGMA busy_timeout=5000")
         with self._conn:
             self._conn.execute(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """为升级前已存在的库表补充新列（幂等）。"""
+        with self._lock, self._conn:
+            cols = {r["name"] for r in
+                    self._conn.execute("PRAGMA table_info(tasks)")}
+            for col, ddl in _MIGRATIONS.items():
+                if col not in cols:
+                    self._conn.execute(ddl)
+                    logger.info("store.migrate 补充缺失列: %s", col)
 
     def close(self) -> None:
         with self._lock:
@@ -69,6 +90,8 @@ class TaskStore:
             version=row["version"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            deadline_at=row["deadline_at"],
+            cancel_requested=bool(row["cancel_requested"]),
         )
 
     def insert_if_absent(self, task: Task) -> tuple[Task, bool]:
@@ -84,11 +107,13 @@ class TaskStore:
             try:
                 self._conn.execute(
                     "INSERT INTO tasks (task_id, idempotency_key, payload_hash, payload,"
-                    " status, attempts, result, error, version, created_at, updated_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    " status, attempts, result, error, version, created_at, updated_at,"
+                    " deadline_at, cancel_requested)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (task.task_id, task.idempotency_key, task.payload_hash, task.payload,
                      task.status.value, task.attempts, task.result, task.error,
-                     task.version, task.created_at, task.updated_at),
+                     task.version, task.created_at, task.updated_at,
+                     task.deadline_at, int(task.cancel_requested)),
                 )
                 logger.info("store.insert key=%s task_id=%s status=%s (新建)",
                             task.idempotency_key, task.task_id, task.status.value)
@@ -114,6 +139,38 @@ class TaskStore:
                 "SELECT * FROM tasks WHERE idempotency_key=?", (idempotency_key,)
             ).fetchone()
         return self._row_to_task(row) if row else None
+
+    def get_by_id(self, task_id: str) -> Task | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+        return self._row_to_task(row) if row else None
+
+    def request_cancel(self, task_id: str) -> None:
+        """持久化取消意图（幂等）。仅对未收尾任务置位；终态任务不受影响。
+
+        意图先落库再做状态迁移，保证进程在两者之间崩溃时，
+        重启后仍能依据该标记完成取消收尾。
+        """
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE tasks SET cancel_requested=1, version=version+1, updated_at=?"
+                " WHERE task_id=? AND status NOT IN"
+                " ('SUCCEEDED','FAILED','CIRCUIT_REJECTED','TIMED_OUT','CANCELLED')",
+                (time.time(), task_id),
+            )
+            logger.info("store.request_cancel task_id=%s 置位行数=%d",
+                        task_id, cur.rowcount)
+
+    def list_unfinished(self) -> list[Task]:
+        """列出所有未收尾任务（供超时/取消清扫使用）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM tasks WHERE status NOT IN"
+                " ('SUCCEEDED','FAILED','CIRCUIT_REJECTED','TIMED_OUT','CANCELLED')"
+            ).fetchall()
+        return [self._row_to_task(r) for r in rows]
 
     def transition(self, task_id: str, expected: TaskStatus, target: TaskStatus,
                    *, result: str | None = None, error: str | None = None,

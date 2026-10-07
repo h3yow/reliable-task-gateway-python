@@ -5,11 +5,11 @@ import logging
 import os
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.breaker import CircuitBreaker
 from app.downstream import RetryPolicy
-from app.service import SubmitOutcome, TaskGateway
+from app.service import SubmitOutcome, TaskGateway, TaskNotFoundError
 from app.store import PayloadConflictError, TaskStore
 
 logging.basicConfig(
@@ -32,6 +32,8 @@ class EchoClient:
 class SubmitRequest(BaseModel):
     idempotency_key: str
     payload: str
+    # 可选：最长执行时限（秒）。不填则不限时，行为与旧版一致
+    timeout_seconds: float | None = Field(default=None, gt=0)
 
 
 def _task_view(task) -> dict:
@@ -42,6 +44,8 @@ def _task_view(task) -> dict:
         "attempts": task.attempts,
         "result": task.result,
         "error": task.error,
+        "deadline_at": task.deadline_at,
+        "cancel_requested": task.cancel_requested,
     }
 
 
@@ -54,7 +58,8 @@ def read_root():
 def submit_task(req: SubmitRequest):
     gateway: TaskGateway = app.state.gateway
     try:
-        task, outcome = gateway.submit(req.idempotency_key, req.payload)
+        task, outcome = gateway.submit(req.idempotency_key, req.payload,
+                                       timeout_seconds=req.timeout_seconds)
     except PayloadConflictError as exc:
         raise HTTPException(
             status_code=409,
@@ -74,6 +79,18 @@ def get_task(idempotency_key: str):
     return _task_view(task)
 
 
+@app.post("/tasks/{idempotency_key}/cancel")
+def cancel_task(idempotency_key: str):
+    gateway: TaskGateway = app.state.gateway
+    try:
+        task, outcome = gateway.cancel(idempotency_key)
+    except TaskNotFoundError:
+        raise HTTPException(status_code=404, detail={"reason": "NOT_FOUND"})
+    body = _task_view(task)
+    body["cancel_outcome"] = outcome.value
+    return body
+
+
 @app.on_event("startup")
 def _startup() -> None:
     store = TaskStore(DB_PATH)
@@ -84,6 +101,8 @@ def _startup() -> None:
         breaker=CircuitBreaker(failure_threshold=3, recovery_timeout=30.0),
         retry=RetryPolicy(max_attempts=3, base_delay=0.1),
     )
+    # 重启恢复：落实重启前持久化的取消意图、按原截止时间收尾超时任务
+    app.state.gateway.sweep()
 
 
 @app.on_event("shutdown")

@@ -34,6 +34,13 @@ class RetryPolicy:
     def max_attempts(self) -> int:
         return self._max_attempts
 
-    def wait(self, attempt: int) -> None:
-        """第 attempt 次失败后的退避等待（指数退避）。"""
-        self._sleep(self._base_delay * (2 ** (attempt - 1)))
+    def delay(self, attempt: int) -> float:
+        """第 attempt 次失败后的退避时长（指数退避）。"""
+        return self._base_delay * (2 ** (attempt - 1))
+
+    def wait(self, attempt: int, cap: float | None = None) -> None:
+        """第 attempt 次失败后的退避等待；cap 给定时时长不超过 cap。"""
+        delay = self.delay(attempt)
+        if cap is not None:
+            delay = min(delay, max(0.0, cap))
+        self._sleep(delay)
