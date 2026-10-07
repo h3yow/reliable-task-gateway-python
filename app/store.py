@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     payload TEXT NOT NULL,
     status TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
+    deadline_at REAL,
     result TEXT,
     error TEXT,
     version INTEGER NOT NULL DEFAULT 0,
@@ -30,6 +31,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at REAL NOT NULL
 )
 """
+
+# 升级兼容：老库（无 deadline_at 列）打开时自动补列，老任务 deadline_at 为 NULL
+# （无时限，行为与升级前完全一致）。
+_MIGRATIONS = (
+    "ALTER TABLE tasks ADD COLUMN deadline_at REAL",
+)
 
 
 class PayloadConflictError(Exception):
@@ -50,6 +57,13 @@ class TaskStore:
         self._conn.execute("PRAGMA busy_timeout=5000")
         with self._conn:
             self._conn.execute(_SCHEMA)
+            existing = {row[1] for row in self._conn.execute("PRAGMA table_info(tasks)")}
+            for stmt in _MIGRATIONS:
+                # 形如 "ALTER TABLE tasks ADD COLUMN deadline_at REAL"
+                column = stmt.split("ADD COLUMN")[1].split()[0]
+                if column not in existing:
+                    logger.info("store.migrate 补充缺失列: %s", column)
+                    self._conn.execute(stmt)
 
     def close(self) -> None:
         with self._lock:
@@ -64,6 +78,7 @@ class TaskStore:
             payload=row["payload"],
             status=TaskStatus(row["status"]),
             attempts=row["attempts"],
+            deadline_at=row["deadline_at"],
             result=row["result"],
             error=row["error"],
             version=row["version"],
@@ -84,11 +99,12 @@ class TaskStore:
             try:
                 self._conn.execute(
                     "INSERT INTO tasks (task_id, idempotency_key, payload_hash, payload,"
-                    " status, attempts, result, error, version, created_at, updated_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    " status, attempts, deadline_at, result, error, version,"
+                    " created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (task.task_id, task.idempotency_key, task.payload_hash, task.payload,
-                     task.status.value, task.attempts, task.result, task.error,
-                     task.version, task.created_at, task.updated_at),
+                     task.status.value, task.attempts, task.deadline_at, task.result,
+                     task.error, task.version, task.created_at, task.updated_at),
                 )
                 logger.info("store.insert key=%s task_id=%s status=%s (新建)",
                             task.idempotency_key, task.task_id, task.status.value)
@@ -114,6 +130,17 @@ class TaskStore:
                 "SELECT * FROM tasks WHERE idempotency_key=?", (idempotency_key,)
             ).fetchone()
         return self._row_to_task(row) if row else None
+
+    def find_expired(self, now: float) -> list[Task]:
+        """查找已超时时限、但仍处于非终态的任务（deadline_at 为 NULL 的无时限任务
+        不参与超时判定）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM tasks WHERE deadline_at IS NOT NULL AND deadline_at <= ?"
+                " AND status IN (?, ?)",
+                (now, TaskStatus.PENDING.value, TaskStatus.RUNNING.value),
+            ).fetchall()
+        return [self._row_to_task(r) for r in rows]
 
     def transition(self, task_id: str, expected: TaskStatus, target: TaskStatus,
                    *, result: str | None = None, error: str | None = None,

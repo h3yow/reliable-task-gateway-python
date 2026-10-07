@@ -32,6 +32,7 @@ class EchoClient:
 class SubmitRequest(BaseModel):
     idempotency_key: str
     payload: str
+    timeout_seconds: float | None = None  # 可选最长执行时限；不传则行为同老版本
 
 
 def _task_view(task) -> dict:
@@ -40,6 +41,7 @@ def _task_view(task) -> dict:
         "idempotency_key": task.idempotency_key,
         "status": task.status.value,
         "attempts": task.attempts,
+        "deadline_at": task.deadline_at,
         "result": task.result,
         "error": task.error,
     }
@@ -54,7 +56,8 @@ def read_root():
 def submit_task(req: SubmitRequest):
     gateway: TaskGateway = app.state.gateway
     try:
-        task, outcome = gateway.submit(req.idempotency_key, req.payload)
+        task, outcome = gateway.submit(req.idempotency_key, req.payload,
+                                       timeout_seconds=req.timeout_seconds)
     except PayloadConflictError as exc:
         raise HTTPException(
             status_code=409,
@@ -62,6 +65,18 @@ def submit_task(req: SubmitRequest):
         )
     body = _task_view(task)
     body["outcome"] = outcome.value
+    return body
+
+
+@app.post("/tasks/{idempotency_key}/cancel")
+def cancel_task(idempotency_key: str):
+    gateway: TaskGateway = app.state.gateway
+    result = gateway.cancel(idempotency_key)
+    if result is None:
+        raise HTTPException(status_code=404, detail={"reason": "NOT_FOUND"})
+    task, outcome = result
+    body = _task_view(task)
+    body["cancel_outcome"] = outcome.value
     return body
 
 
@@ -78,14 +93,17 @@ def get_task(idempotency_key: str):
 def _startup() -> None:
     store = TaskStore(DB_PATH)
     app.state.store = store
-    app.state.gateway = TaskGateway(
+    gateway = TaskGateway(
         store=store,
         client=EchoClient(),
         breaker=CircuitBreaker(failure_threshold=3, recovery_timeout=30.0),
         retry=RetryPolicy(max_attempts=3, base_delay=0.1),
     )
+    gateway.start_timeout_sweeper(interval_seconds=0.5)
+    app.state.gateway = gateway
 
 
 @app.on_event("shutdown")
 def _shutdown() -> None:
+    app.state.gateway.stop_timeout_sweeper()
     app.state.store.close()
